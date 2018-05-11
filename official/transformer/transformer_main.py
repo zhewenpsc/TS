@@ -22,6 +22,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import os
 import tempfile
 
@@ -30,6 +31,7 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 from absl import app as absl_app
 from absl import flags
 import tensorflow as tf
+from tensorflow.contrib import summary as contrib_summary
 # pylint: enable=g-bad-import-order
 
 from official.transformer import compute_bleu
@@ -39,6 +41,7 @@ from official.transformer.model import model_params
 from official.transformer.model import transformer
 from official.transformer.utils import dataset
 from official.transformer.utils import metrics
+from official.transformer.utils import schedule
 from official.transformer.utils import tokenizer
 from official.utils.flags import core as flags_core
 from official.utils.logs import hooks_helper
@@ -74,30 +77,105 @@ def model_fn(features, labels, mode, params):
     # When in prediction mode, the labels/targets is None. The model output
     # is the prediction
     if mode == tf.estimator.ModeKeys.PREDICT:
+      if params["use_tpu"]:
+        raise NotImplementedError("prediction is not yet supported.")
       return tf.estimator.EstimatorSpec(
           tf.estimator.ModeKeys.PREDICT,
           predictions=output)
 
     logits = output
 
+    # Explicitly set the shape of the logits for XLA (TPU). This is needed
+    # because the logits are passed back to the host VM CPU for metric
+    # evaluation, and the shape of [?, ?, vocab_size] is too vague. However
+    # it is known from Transformer that the first two dimensions of logits
+    # are the dimensions of targets. Note that the ambiguous shape of logits is
+    # not a problem when computing xentropy, because padded_cross_entropy_loss
+    # resolves the shape on the TPU.
+    logits.set_shape(targets.shape.as_list() + logits.shape.as_list()[2:])
+
     # Calculate model loss.
     # xentropy contains the cross entropy loss of every nonpadding token in the
     # targets.
     xentropy, weights = metrics.padded_cross_entropy_loss(
-        logits, targets, params.label_smoothing, params.vocab_size)
-    # Compute the weighted mean of the cross entropy losses
+        logits, targets, params["label_smoothing"], params["vocab_size"])
     loss = tf.reduce_sum(xentropy) / tf.reduce_sum(weights)
 
     # Save loss as named tensor that will be logged with the logging hook.
     tf.identity(loss, "cross_entropy")
 
     if mode == tf.estimator.ModeKeys.EVAL:
+      if params["use_tpu"]:
+        metric_fn = functools.partial(metrics.get_eval_metrics, params=params)
+        eval_metrics = (metric_fn, [logits, labels])
+        return tf.contrib.tpu.TPUEstimatorSpec(
+            mode=mode, loss=loss, predictions={"predictions": logits},
+            eval_metrics=eval_metrics)
       return tf.estimator.EstimatorSpec(
           mode=mode, loss=loss, predictions={"predictions": logits},
           eval_metric_ops=metrics.get_eval_metrics(logits, labels, params))
     else:
-      train_op = get_train_op(loss, params)
+      train_op, metric_dict = get_train_op(loss, params)
+
+      # Epochs can be quite long. This give some intermediate information
+      # in TensorBoard.
+      metric_dict["minibatch_loss"] = loss
+      if params["use_tpu"]:
+        return tf.contrib.tpu.TPUEstimatorSpec(
+            mode=mode, loss=loss, train_op=train_op,
+            host_call=construct_host_call(metric_dict, params)
+        )
+      record_scalars(metric_dict)
       return tf.estimator.EstimatorSpec(mode=mode, loss=loss, train_op=train_op)
+
+
+def construct_host_call(metric_dict, params):
+  def host_call_fn(gs, ls, lr, gn):
+    """Training host call. Creates scalar summaries for training metrics.
+
+    This function is executed on the CPU and should not directly reference
+    any Tensors in the rest of the `model_fn`. To pass Tensors from the
+    model to the `metric_fn`, provide as part of the `host_call`. See
+    https://www.tensorflow.org/api_docs/python/tf/contrib/tpu/TPUEstimatorSpec
+    for more information.
+
+    Arguments should match the list of `Tensor` objects passed as the second
+    element in the tuple passed to `host_call`.
+
+    Args:
+      gs: `Tensor with shape `[batch]` for the global_step
+      lr: `Tensor` with shape `[batch]` for the learning_rate.
+      gn: `Tensor` with shape `[batch]` for the gradient_norm.
+
+    Returns:
+      List of summary ops to run on the CPU host.
+    """
+    gs = gs[0]
+    with contrib_summary.create_file_writer(params["model_dir"]).as_default():
+      with contrib_summary.always_record_summaries():
+        contrib_summary.scalar("minibatch_loss", ls[0], step=gs)
+        contrib_summary.scalar("learning_rate", lr[0], step=gs)
+        contrib_summary.scalar("global_norm/gradient_norm", gn[0], step=gs)
+
+        return contrib_summary.all_summary_ops()
+
+  # To log the current learning rate, and gradient norm for Tensorboard, the
+  # summary op needs to be run on the host CPU via host_call. host_call
+  # expects [batch_size, ...] Tensors, thus reshape to introduce a batch
+  # dimension. These Tensors are implicitly concatenated to
+  # [params['batch_size']].
+
+  gs_t = tf.reshape(tf.train.get_or_create_global_step(), [1])
+  ls_t = tf.reshape(metric_dict["minibatch_loss"], [1])
+  lr_t = tf.reshape(metric_dict["learning_rate"], [1])
+  gn_t = tf.reshape(metric_dict["global_norm/gradient_norm"], [1])
+
+  return host_call_fn, [gs_t, ls_t, lr_t, gn_t]
+
+
+def record_scalars(metric_dict):
+  for key, value in metric_dict.items():
+    tf.summary.scalar(name=key, tensor=value)
 
 
 def get_learning_rate(learning_rate, hidden_size, learning_rate_warmup_steps):
@@ -116,26 +194,28 @@ def get_learning_rate(learning_rate, hidden_size, learning_rate_warmup_steps):
     # The full name includes variable and names scope. In this case, the name
     # is model/get_train_op/learning_rate/learning_rate
     tf.identity(learning_rate, "learning_rate")
-    # Save learning rate value to TensorBoard summary.
-    tf.summary.scalar("learning_rate", learning_rate)
 
     return learning_rate
 
 
 def get_train_op(loss, params):
-  """Generate training operation that updates variables based on loss."""
+  """Generate training op and summary dict."""
   with tf.variable_scope("get_train_op"):
     learning_rate = get_learning_rate(
-        params.learning_rate, params.hidden_size,
-        params.learning_rate_warmup_steps)
+        learning_rate=params["learning_rate"],
+        hidden_size=params["hidden_size"],
+        learning_rate_warmup_steps=params["learning_rate_warmup_steps"])
 
     # Create optimizer. Use LazyAdamOptimizer from TF contrib, which is faster
     # than the TF core Adam optimizer.
     optimizer = tf.contrib.opt.LazyAdamOptimizer(
         learning_rate,
-        beta1=params.optimizer_adam_beta1,
-        beta2=params.optimizer_adam_beta2,
-        epsilon=params.optimizer_adam_epsilon)
+        beta1=params["optimizer_adam_beta1"],
+        beta2=params["optimizer_adam_beta2"],
+        epsilon=params["optimizer_adam_epsilon"])
+
+    if params["use_tpu"]:
+      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
     # Calculate and apply gradients using LazyAdamOptimizer.
     global_step = tf.train.get_global_step()
@@ -145,11 +225,10 @@ def get_train_op(loss, params):
     train_op = optimizer.apply_gradients(
         gradients, global_step=global_step, name="train")
 
-    # Save gradient norm to Tensorboard
-    tf.summary.scalar("global_norm/gradient_norm",
-                      tf.global_norm(list(zip(*gradients))[0]))
+    gradient_norm = tf.global_norm(list(zip(*gradients))[0])
 
-    return train_op
+    return train_op, {"learning_rate": learning_rate,
+                      "global_norm/gradient_norm": gradient_norm}
 
 
 def translate_and_compute_bleu(estimator, subtokenizer, bleu_source, bleu_ref):
@@ -186,9 +265,8 @@ def evaluate_and_log_bleu(estimator, bleu_source, bleu_ref, vocab_file_path):
   return uncased_score, cased_score
 
 
-def train_schedule(
-    estimator, train_eval_iterations, single_iteration_train_steps=None,
-    single_iteration_train_epochs=None, train_hooks=None, benchmark_logger=None,
+def run_loop(
+    estimator, schedule_manager, train_hooks=None, benchmark_logger=None,
     bleu_source=None, bleu_ref=None, bleu_threshold=None, vocab_file_path=None):
   """Train and evaluate model, and optionally compute model's BLEU score.
 
@@ -215,41 +293,21 @@ def train_schedule(
 
   Args:
     estimator: tf.Estimator containing model to train.
-    train_eval_iterations: Number of times to repeat the train+eval iteration.
-    single_iteration_train_steps: Number of steps to train in one iteration.
-    single_iteration_train_epochs: Number of epochs to train in one iteration.
+    schedule_manager: A schedule.Manager object to guide the run loop.
     train_hooks: List of hooks to pass to the estimator during training.
     benchmark_logger: a BenchmarkLogger object that logs evaluation data
     bleu_source: File containing text to be translated for BLEU calculation.
     bleu_ref: File containing reference translations for BLEU calculation.
     bleu_threshold: minimum BLEU score before training is stopped.
     vocab_file_path: Path to vocabulary file used to subtokenize bleu_source.
-
-  Raises:
-    ValueError: if both or none of single_iteration_train_steps and
-      single_iteration_train_epochs were defined.
   """
-  # Ensure that exactly one of single_iteration_train_steps and
-  # single_iteration_train_epochs is defined.
-  if single_iteration_train_steps is None:
-    if single_iteration_train_epochs is None:
-      raise ValueError(
-          "Exactly one of single_iteration_train_steps or "
-          "single_iteration_train_epochs must be defined. Both were none.")
-  else:
-    if single_iteration_train_epochs is not None:
-      raise ValueError(
-          "Exactly one of single_iteration_train_steps or "
-          "single_iteration_train_epochs must be defined. Both were defined.")
 
   evaluate_bleu = bleu_source is not None and bleu_ref is not None
 
   # Print details of training schedule.
   tf.logging.info("Training schedule:")
-  if single_iteration_train_epochs is not None:
-    tf.logging.info("\t1. Train for %d epochs." % single_iteration_train_epochs)
-  else:
-    tf.logging.info("\t1. Train for %d steps." % single_iteration_train_steps)
+  tf.logging.info(
+      "\t1. Train for {}".format(schedule_manager.train_increment_str))
   tf.logging.info("\t2. Evaluate model.")
   if evaluate_bleu:
     tf.logging.info("\t3. Compute BLEU score.")
@@ -257,7 +315,8 @@ def train_schedule(
       tf.logging.info("Repeat above steps until the BLEU score reaches %f" %
                       bleu_threshold)
   if not evaluate_bleu or bleu_threshold is None:
-    tf.logging.info("Repeat above steps %d times." % train_eval_iterations)
+    tf.logging.info("Repeat above steps %d times." %
+                    schedule_manager.train_eval_iterations)
 
   if evaluate_bleu:
     # Create summary writer to log bleu score (values can be displayed in
@@ -269,18 +328,26 @@ def train_schedule(
       train_eval_iterations = INF
 
   # Loop training/evaluation/bleu cycles
-  for i in xrange(train_eval_iterations):
+  for i in xrange(schedule_manager.train_eval_iterations):
     tf.logging.info("Starting iteration %d" % (i + 1))
 
     # Train the model for single_iteration_train_steps or until the input fn
     # runs out of examples (if single_iteration_train_steps is None).
     estimator.train(
-        dataset.train_input_fn, steps=single_iteration_train_steps,
+        dataset.train_input_fn,
+        steps=schedule_manager.single_iteration_train_steps,
         hooks=train_hooks)
 
-    eval_results = estimator.evaluate(dataset.eval_input_fn)
+    schedule_manager.post_train()
+
+    eval_results = estimator.evaluate(
+        input_fn=dataset.eval_input_fn,
+        steps=schedule_manager.single_iteration_eval_steps)
+
+    schedule_manager.post_eval()
+
     tf.logging.info("Evaluation results (iter %d/%d):" %
-                    (i + 1, train_eval_iterations))
+                    (i + 1, schedule_manager.train_eval_iterations))
     tf.logging.info(eval_results)
     benchmark_logger.log_evaluation_result(eval_results)
 
@@ -325,6 +392,7 @@ def define_transformer_flags():
       dtype=False
   )
   flags_core.define_benchmark()
+  flags_core.define_device(tpu=True)
 
   # Set flags from the flags_core module as "key flags" so they're listed when
   # the '-h' flag is used. Without this line, the flags defined above are
@@ -342,6 +410,16 @@ def define_transformer_flags():
           "and various other settings. The big parameter set increases the "
           "default batch size, embedding/hidden size, and filter size. For a "
           "complete list of parameters, please see model/model_params.py."))
+
+  flags.DEFINE_bool(
+      name="static_batch", default=False,
+      help=flags_core.help_wrap(
+          "Whether the batches in the dataset should have static shapes. In "
+          "general, this setting should be False. Dynamic shapes allow the "
+          "inputs to be grouped so that the number of padding tokens is "
+          "minimized, and helps model training. In cases where the input shape "
+          "must be static (e.g. running on TPU), this setting will be ignored "
+          "and static batching will always be used."))
 
   # Flags for training with steps (may be used for debugging)
   flags.DEFINE_integer(
@@ -403,6 +481,41 @@ def define_transformer_flags():
         tf.gfile.Exists(flags_dict["bleu_ref"]),
         tf.gfile.Exists(vocab_file_path)])
 
+  flags_core.require_cloud_storage(["data_dir", "model_dir"])
+
+
+def construct_estimator(flags_obj, params, schedule_manager):
+  if not params["use_tpu"]:
+    return tf.estimator.Estimator(
+        model_fn=model_fn, model_dir=flags_obj.model_dir, params=params)
+
+  tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+      tpu=flags_obj.tpu,
+      zone=flags_obj.tpu_zone,
+      project=flags_obj.tpu_gcp_project
+  )
+
+  tpu_config = tf.contrib.tpu.TPUConfig(
+      iterations_per_loop = schedule_manager.single_iteration_train_steps,
+      num_shards=flags_obj.num_tpu_shards)
+
+  run_config = tf.contrib.tpu.RunConfig(
+      cluster=tpu_cluster_resolver,
+      model_dir=flags_obj.model_dir,
+      session_config=tf.ConfigProto(
+          allow_soft_placement=True, log_device_placement=True),
+      tpu_config=tpu_config)
+
+  return tf.contrib.tpu.TPUEstimator(
+      model_fn=model_fn,
+      use_tpu=params["use_tpu"],
+      train_batch_size=schedule_manager.batch_size,
+      eval_batch_size=schedule_manager.batch_size,
+      params={
+        # TPUEstimator needs to populate batch_size itself due to sharding.
+        key: value for key, value in params.items() if key != "batch_size"},
+      config=run_config)
+
 
 def run_transformer(flags_obj):
   """Create tf.Estimator to train and evaluate transformer model.
@@ -410,47 +523,52 @@ def run_transformer(flags_obj):
   Args:
     flags_obj: Object containing parsed flag values.
   """
-  # Determine training schedule based on flags.
-  if flags_obj.train_steps is not None:
-    train_eval_iterations = (
-        flags_obj.train_steps // flags_obj.steps_between_evals)
-    single_iteration_train_steps = flags_obj.steps_between_evals
-    single_iteration_train_epochs = None
-  else:
-    train_epochs = flags_obj.train_epochs or DEFAULT_TRAIN_EPOCHS
-    train_eval_iterations = train_epochs // flags_obj.epochs_between_evals
-    single_iteration_train_steps = None
-    single_iteration_train_epochs = flags_obj.epochs_between_evals
-
   # Add flag-defined parameters to params object
-  params = PARAMS_MAP[flags_obj.param_set]
-  params.data_dir = flags_obj.data_dir
-  params.num_parallel_calls = flags_obj.num_parallel_calls
-  params.epochs_between_evals = flags_obj.epochs_between_evals
-  params.repeat_dataset = single_iteration_train_epochs
-  params.batch_size = flags_obj.batch_size or params.batch_size
+  params = PARAMS_MAP[flags_obj.param_set]().dict
+  params["data_dir"] = flags_obj.data_dir
+  params["model_dir"] = flags_obj.model_dir
+  params["num_parallel_calls"] = flags_obj.num_parallel_calls
+
+  params["use_tpu"] = bool(flags_obj.tpu)  # was a tpu specified.
+  params["batch_size"] = flags_obj.batch_size or (
+    params["default_batch_size_tpu"] if params["use_tpu"]
+    else params["default_batch_size"])
+  params["static_batch"] = flags_obj.static_batch or params["use_tpu"]
+  params["no_ffn_pad"] = params["use_tpu"]
+
+  schedule_manager = schedule.Manager(
+      train_steps=flags_obj.train_steps,
+      steps_between_evals=flags_obj.steps_between_evals,
+      train_epochs=flags_obj.train_epochs,
+      epochs_between_evals=flags_obj.epochs_between_evals,
+      default_train_epochs=DEFAULT_TRAIN_EPOCHS,
+      batch_size=params["batch_size"],
+      max_length=params["max_length"],
+      use_tpu=params["use_tpu"],
+      num_tpu_shards=flags_obj.num_tpu_shards
+  )
+
+  params["repeat_dataset"] = schedule_manager.repeat_dataset
 
   # Create hooks that log information about the training and metric values
   train_hooks = hooks_helper.get_train_hooks(
       flags_obj.hooks,
       tensors_to_log=TENSORS_TO_LOG,  # used for logging hooks
-      batch_size=params.batch_size  # for ExamplesPerSecondHook
+      batch_size=schedule_manager.batch_size,  # for ExamplesPerSecondHook
+      use_tpu=params["use_tpu"]  # Not all hooks can run with TPUs
   )
   benchmark_logger = logger.config_benchmark_logger(flags_obj)
   benchmark_logger.log_run_info(
       model_name="transformer",
       dataset_name="wmt_translate_ende",
-      run_params=params.__dict__)
+      run_params=params)
 
   # Train and evaluate transformer model
-  estimator = tf.estimator.Estimator(
-      model_fn=model_fn, model_dir=flags_obj.model_dir, params=params)
-  train_schedule(
+  estimator = construct_estimator(flags_obj, params, schedule_manager)
+  run_loop(
       estimator=estimator,
       # Training arguments
-      train_eval_iterations=train_eval_iterations,
-      single_iteration_train_steps=single_iteration_train_steps,
-      single_iteration_train_epochs=single_iteration_train_epochs,
+      schedule_manager=schedule_manager,
       train_hooks=train_hooks,
       benchmark_logger=benchmark_logger,
       # BLEU calculation arguments

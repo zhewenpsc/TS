@@ -14,11 +14,14 @@
 # ==============================================================================
 """Defines Transformer model parameters."""
 
+from  official.utils.misc import model_helpers
 
-class TransformerBaseParams(object):
+
+class TransformerBaseParams(model_helpers.ParameterContainer):
   """Parameters for the base Transformer model."""
   # Input params
-  batch_size = 2048  # Maximum number of tokens per batch of examples.
+  default_batch_size = 2048  # Maximum number of tokens per batch of examples.
+  default_batch_size_tpu = 32768
   max_length = 256  # Maximum number of tokens per example.
 
   # Model params
@@ -50,10 +53,17 @@ class TransformerBaseParams(object):
   beam_size = 4
   alpha = 0.6  # used to calculate length normalization in beam search
 
+  # TPU specific parameters
+  use_tpu = False
+  static_batch = False
+  no_ffn_pad = False
+
 
 class TransformerBigParams(TransformerBaseParams):
   """Parameters for the big Transformer model."""
-  batch_size = 4096
+  default_batch_size = 4096
+  default_batch_size_tpu = 16384  # default batch size is smaller than for
+                                  # BaseParams due to memory limits of the TPU
   hidden_size = 1024
   filter_size = 4096
   num_heads = 16
