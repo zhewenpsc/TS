@@ -51,8 +51,8 @@ from official.utils.misc import model_helpers
 
 
 PARAMS_MAP = {
-    "base": model_params.TransformerBaseParams,
-    "big": model_params.TransformerBigParams,
+    "base": model_params.BASE_PARAMS,
+    "big": model_params.BIG_PARAMS,
 }
 DEFAULT_TRAIN_EPOCHS = 10
 BLEU_DIR = "bleu"
@@ -482,7 +482,7 @@ def run_transformer(flags_obj):
     flags_obj: Object containing parsed flag values.
   """
   # Add flag-defined parameters to params object
-  params = PARAMS_MAP[flags_obj.param_set]().dict
+  params = PARAMS_MAP[flags_obj.param_set]
   params["data_dir"] = flags_obj.data_dir
   params["model_dir"] = flags_obj.model_dir
   params["num_parallel_calls"] = flags_obj.num_parallel_calls
