@@ -305,7 +305,7 @@ class EncoderStack(tf.layers.Layer):
           params["hidden_size"], params["num_heads"], params["attention_dropout"], train)
       feed_forward_network = ffn_layer.FeedFowardNetwork(
           params["hidden_size"], params["filter_size"], params["relu_dropout"], train,
-          params["no_ffn_pad"])
+          params["allow_ffn_pad"])
 
       self.layers.append([
           PrePostProcessingWrapper(self_attention_layer, params, train),
@@ -362,7 +362,7 @@ class DecoderStack(tf.layers.Layer):
           params["hidden_size"], params["num_heads"], params["attention_dropout"], train)
       feed_forward_network = ffn_layer.FeedFowardNetwork(
           params["hidden_size"], params["filter_size"], params["relu_dropout"], train,
-          params["no_ffn_pad"])
+          params["allow_ffn_pad"])
 
       self.layers.append([
           PrePostProcessingWrapper(self_attention_layer, params, train),

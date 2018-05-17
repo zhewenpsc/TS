@@ -53,7 +53,7 @@ BASE_PARAMS = dict(
     # TPU specific parameters
     use_tpu=False,
     static_batch=False,
-    no_ffn_pad=False  # TODO(robieta): replace with `allow_ffn_pad`
+    allow_ffn_pad=True,
 )
 
 BIG_PARAMS = {k: v for k, v in BASE_PARAMS.items()}

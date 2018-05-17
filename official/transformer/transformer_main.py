@@ -492,7 +492,7 @@ def run_transformer(flags_obj):
     params["default_batch_size_tpu"] if params["use_tpu"]
     else params["default_batch_size"])
   params["static_batch"] = flags_obj.static_batch or params["use_tpu"]
-  params["no_ffn_pad"] = params["use_tpu"]
+  params["allow_ffn_pad"] = not params["use_tpu"]
 
   schedule_manager = schedule.Manager(
       train_steps=flags_obj.train_steps,
