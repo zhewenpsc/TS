@@ -43,6 +43,7 @@ from official.transformer.utils import dataset
 from official.transformer.utils import metrics
 from official.transformer.utils import schedule
 from official.transformer.utils import tokenizer
+from official.utils.accelerator import tpu as tpu_util
 from official.utils.flags import core as flags_core
 from official.utils.logs import hooks_helper
 from official.utils.logs import logger
@@ -123,59 +124,16 @@ def model_fn(features, labels, mode, params):
       if params["use_tpu"]:
         return tf.contrib.tpu.TPUEstimatorSpec(
             mode=mode, loss=loss, train_op=train_op,
-            host_call=construct_host_call(metric_dict, params)
+            host_call=tpu_util.construct_scalar_host_call(
+                metric_dict=metric_dict, model_dir=params["model_dir"])
         )
       record_scalars(metric_dict)
       return tf.estimator.EstimatorSpec(mode=mode, loss=loss, train_op=train_op)
 
 
-def construct_host_call(metric_dict, params):
-  def host_call_fn(gs, ls, lr, gn):
-    """Training host call. Creates scalar summaries for training metrics.
-
-    This function is executed on the CPU and should not directly reference
-    any Tensors in the rest of the `model_fn`. To pass Tensors from the
-    model to the `metric_fn`, provide as part of the `host_call`. See
-    https://www.tensorflow.org/api_docs/python/tf/contrib/tpu/TPUEstimatorSpec
-    for more information.
-
-    Arguments should match the list of `Tensor` objects passed as the second
-    element in the tuple passed to `host_call`.
-
-    Args:
-      gs: `Tensor with shape `[batch]` for the global_step
-      lr: `Tensor` with shape `[batch]` for the learning_rate.
-      gn: `Tensor` with shape `[batch]` for the gradient_norm.
-
-    Returns:
-      List of summary ops to run on the CPU host.
-    """
-    gs = gs[0]
-    with contrib_summary.create_file_writer(params["model_dir"]).as_default():
-      with contrib_summary.always_record_summaries():
-        contrib_summary.scalar("minibatch_loss", ls[0], step=gs)
-        contrib_summary.scalar("learning_rate", lr[0], step=gs)
-        contrib_summary.scalar("global_norm/gradient_norm", gn[0], step=gs)
-
-        return contrib_summary.all_summary_ops()
-
-  # To log the current learning rate, and gradient norm for Tensorboard, the
-  # summary op needs to be run on the host CPU via host_call. host_call
-  # expects [batch_size, ...] Tensors, thus reshape to introduce a batch
-  # dimension. These Tensors are implicitly concatenated to
-  # [params['batch_size']].
-
-  gs_t = tf.reshape(tf.train.get_or_create_global_step(), [1])
-  ls_t = tf.reshape(metric_dict["minibatch_loss"], [1])
-  lr_t = tf.reshape(metric_dict["learning_rate"], [1])
-  gn_t = tf.reshape(metric_dict["global_norm/gradient_norm"], [1])
-
-  return host_call_fn, [gs_t, ls_t, lr_t, gn_t]
-
-
 def record_scalars(metric_dict):
   for key, value in metric_dict.items():
-    tf.summary.scalar(name=key, tensor=value)
+    contrib_summary.scalar(name=key, tensor=value)
 
 
 def get_learning_rate(learning_rate, hidden_size, learning_rate_warmup_steps):
