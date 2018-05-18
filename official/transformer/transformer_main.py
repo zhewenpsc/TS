@@ -31,7 +31,6 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 from absl import app as absl_app
 from absl import flags
 import tensorflow as tf
-from tensorflow.contrib import summary as contrib_summary
 # pylint: enable=g-bad-import-order
 
 from official.transformer import compute_bleu
@@ -107,6 +106,9 @@ def model_fn(features, labels, mode, params):
 
     if mode == tf.estimator.ModeKeys.EVAL:
       if params["use_tpu"]:
+        # host call functions should only have tensors as arguments.
+        # functools.partial() pre-populates params so that metric_fn is
+        # TPUEstimator compliant.
         metric_fn = functools.partial(metrics.get_eval_metrics, params=params)
         eval_metrics = (metric_fn, [logits, labels])
         return tf.contrib.tpu.TPUEstimatorSpec(
@@ -118,7 +120,7 @@ def model_fn(features, labels, mode, params):
     else:
       train_op, metric_dict = get_train_op(loss, params)
 
-      # Epochs can be quite long. This give some intermediate information
+      # Epochs can be quite long. This gives some intermediate information
       # in TensorBoard.
       metric_dict["minibatch_loss"] = loss
       if params["use_tpu"]:
@@ -133,7 +135,7 @@ def model_fn(features, labels, mode, params):
 
 def record_scalars(metric_dict):
   for key, value in metric_dict.items():
-    contrib_summary.scalar(name=key, tensor=value)
+    tf.contrib.summary.scalar(name=key, tensor=value)
 
 
 def get_learning_rate(learning_rate, hidden_size, learning_rate_warmup_steps):
@@ -296,13 +298,15 @@ def run_loop(
         steps=schedule_manager.single_iteration_train_steps,
         hooks=train_hooks)
 
-    schedule_manager.post_train()
+    if schedule_manager.use_tpu:
+      tpu_util.sleep_to_clear_queues()
 
     eval_results = estimator.evaluate(
         input_fn=dataset.eval_input_fn,
         steps=schedule_manager.single_iteration_eval_steps)
 
-    schedule_manager.post_eval()
+    if schedule_manager.use_tpu:
+      tpu_util.sleep_to_clear_queues()
 
     tf.logging.info("Evaluation results (iter %d/%d):" %
                     (i + 1, schedule_manager.train_eval_iterations))

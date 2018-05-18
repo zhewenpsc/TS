@@ -14,7 +14,6 @@
 # ==============================================================================
 
 import tensorflow as tf
-from tensorflow.contrib import summary as contrib_summary
 
 
 # TODO(robieta): See if some version of this can be rolled into TPUEstimator.
@@ -42,13 +41,13 @@ def construct_scalar_host_call(metric_dict, model_dir):
       List of summary ops to run on the CPU host.
     """
     gs = gs[0]
-    with contrib_summary.create_file_writer(
+    with tf.contrib.summary.create_file_writer(
         logdir=model_dir, filename_suffix=".host_call").as_default():
-      with contrib_summary.always_record_summaries():
+      with tf.contrib.summary.always_record_summaries():
         for i, name in enumerate(metric_names):
-          contrib_summary.scalar(name, args[i][0], step=gs)
+          tf.contrib.summary.scalar(name, args[i][0], step=gs)
 
-        return contrib_summary.all_summary_ops()
+        return tf.contrib.summary.all_summary_ops()
 
   # To log the current learning rate, and gradient norm for Tensorboard, the
   # summary op needs to be run on the host CPU via host_call. host_call
@@ -59,3 +58,13 @@ def construct_scalar_host_call(metric_dict, model_dir):
   other_tensors = [tf.reshape(metric_dict[key], [1]) for key in metric_names]
 
   return host_call_fn, [gs_t] + other_tensors
+
+def sleep_to_clear_queues():
+  """Sleep for a minute if TPUs are used.
+
+  There is currently an issue with TPUs where starting a train or evaluation
+  before all of the TPU queues have cleared causes the TPU to freeze. This
+  is a temporary workaround until the issue can be properly resolved.
+  """
+  tf.logging.info("Sleeping to allow TPU queues to clear.")
+  time.sleep(60)
