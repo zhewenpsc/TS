@@ -17,7 +17,7 @@ import tensorflow as tf
 
 
 # TODO(robieta): See if some version of this can be rolled into TPUEstimator.
-def construct_scalar_host_call(metric_dict, model_dir):
+def construct_scalar_host_call(metric_dict, model_dir, prefix=""):
   # type: (dict, str) -> (function, list)
   metric_names = list(metric_dict.keys())
 
@@ -45,7 +45,7 @@ def construct_scalar_host_call(metric_dict, model_dir):
         logdir=model_dir, filename_suffix=".host_call").as_default():
       with tf.contrib.summary.always_record_summaries():
         for i, name in enumerate(metric_names):
-          tf.contrib.summary.scalar(name, args[i][0], step=gs)
+          tf.contrib.summary.scalar(prefix + name, args[i][0], step=gs)
 
         return tf.contrib.summary.all_summary_ops()
 

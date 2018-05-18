@@ -72,18 +72,16 @@ def model_fn(features, labels, mode, params):
     # Create model and get output logits.
     model = transformer.Transformer(params, mode == tf.estimator.ModeKeys.TRAIN)
 
-    output = model(inputs, targets)
+    logits = model(inputs, targets)
 
     # When in prediction mode, the labels/targets is None. The model output
     # is the prediction
     if mode == tf.estimator.ModeKeys.PREDICT:
       if params["use_tpu"]:
-        raise NotImplementedError("prediction is not yet supported.")
+        raise NotImplementedError("Prediction is not yet supported on TPUs.")
       return tf.estimator.EstimatorSpec(
           tf.estimator.ModeKeys.PREDICT,
-          predictions=output)
-
-    logits = output
+          predictions=logits)
 
     # Explicitly set the shape of the logits for XLA (TPU). This is needed
     # because the logits are passed back to the host VM CPU for metric
@@ -127,7 +125,8 @@ def model_fn(features, labels, mode, params):
         return tf.contrib.tpu.TPUEstimatorSpec(
             mode=mode, loss=loss, train_op=train_op,
             host_call=tpu_util.construct_scalar_host_call(
-                metric_dict=metric_dict, model_dir=params["model_dir"])
+                metric_dict=metric_dict, model_dir=params["model_dir"],
+                prefix="training/")
         )
       record_scalars(metric_dict)
       return tf.estimator.EstimatorSpec(mode=mode, loss=loss, train_op=train_op)
@@ -185,10 +184,16 @@ def get_train_op(loss, params):
     train_op = optimizer.apply_gradients(
         gradients, global_step=global_step, name="train")
 
-    gradient_norm = tf.global_norm(list(zip(*gradients))[0])
+    metrics = {"learning_rate": learning_rate}
 
-    return train_op, {"learning_rate": learning_rate,
-                      "global_norm/gradient_norm": gradient_norm}
+    if not params["use_tpu"]:
+      # TODO(robieta): Find out why.
+      # The gradient norm summary is empirically observed to be unstable with
+      # TPUs.
+      gradient_norm = tf.global_norm(list(zip(*gradients))[0])
+      metrics["global_norm/gradient_norm"] = gradient_norm
+
+    return train_op, metrics
 
 
 def translate_and_compute_bleu(estimator, subtokenizer, bleu_source, bleu_ref):
