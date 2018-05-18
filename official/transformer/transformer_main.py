@@ -50,6 +50,7 @@ from official.utils.misc import model_helpers
 
 
 PARAMS_MAP = {
+    "tiny": model_params.TINY_PARAMS,
     "base": model_params.BASE_PARAMS,
     "big": model_params.BIG_PARAMS,
 }
@@ -173,7 +174,7 @@ def get_train_op(loss, params):
         beta2=params["optimizer_adam_beta2"],
         epsilon=params["optimizer_adam_epsilon"])
 
-    if params["use_tpu"]:
+    if params["use_tpu"] and params["tpu"] != tpu_util.DRY_RUN:
       optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
     # Calculate and apply gradients using LazyAdamOptimizer.
@@ -369,7 +370,7 @@ def define_transformer_flags():
   # Add transformer-specific flags
   flags.DEFINE_enum(
       name="param_set", short_name="mp", default="big",
-      enum_values=["base", "big"],
+      enum_values=["base", "big", "tiny"],
       help=flags_core.help_wrap(
           "Parameter set to use when creating and training the model. The "
           "parameters define the input shape (batch size and max length), "
@@ -456,11 +457,15 @@ def construct_estimator(flags_obj, params, schedule_manager):
     return tf.estimator.Estimator(
         model_fn=model_fn, model_dir=flags_obj.model_dir, params=params)
 
-  tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-      tpu=flags_obj.tpu,
-      zone=flags_obj.tpu_zone,
-      project=flags_obj.tpu_gcp_project
-  )
+  dry_run = (flags_obj.tpu == tpu_util.DRY_RUN)
+  if dry_run:
+    tpu_cluster_resolver = None
+  else:
+    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+        tpu=flags_obj.tpu,
+        zone=flags_obj.tpu_zone,
+        project=flags_obj.tpu_gcp_project
+    )
 
   tpu_config = tf.contrib.tpu.TPUConfig(
       iterations_per_loop = schedule_manager.single_iteration_train_steps,
@@ -475,7 +480,7 @@ def construct_estimator(flags_obj, params, schedule_manager):
 
   return tf.contrib.tpu.TPUEstimator(
       model_fn=model_fn,
-      use_tpu=params["use_tpu"],
+      use_tpu=params["use_tpu"] and not dry_run,
       train_batch_size=schedule_manager.batch_size,
       eval_batch_size=schedule_manager.batch_size,
       params={
@@ -496,6 +501,7 @@ def run_transformer(flags_obj):
   params["model_dir"] = flags_obj.model_dir
   params["num_parallel_calls"] = flags_obj.num_parallel_calls
 
+  params["tpu"] = flags_obj.tpu
   params["use_tpu"] = bool(flags_obj.tpu)  # was a tpu specified.
   params["batch_size"] = flags_obj.batch_size or (
     params["default_batch_size_tpu"] if params["use_tpu"]

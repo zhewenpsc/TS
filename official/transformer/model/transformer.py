@@ -57,7 +57,8 @@ class Transformer(object):
     self.params = params
 
     self.embedding_softmax_layer = embedding_layer.EmbeddingSharedWeights(
-        params["vocab_size"], params["hidden_size"])
+        params["vocab_size"], params["hidden_size"],
+        method="matmul" if params["tpu"] else "gather")
     self.encoder_stack = EncoderStack(params, train)
     self.decoder_stack = DecoderStack(params, train)
 

@@ -13,7 +13,17 @@
 # limitations under the License.
 # ==============================================================================
 
+import time
+
 import tensorflow as tf
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import embedding_ops
+from tensorflow.python.ops import math_ops
+
+
+DRY_RUN = "dry_run"
 
 
 # TODO(robieta): See if some version of this can be rolled into TPUEstimator.
@@ -59,6 +69,7 @@ def construct_scalar_host_call(metric_dict, model_dir, prefix=""):
 
   return host_call_fn, [gs_t] + other_tensors
 
+
 def sleep_to_clear_queues():
   """Sleep for a minute if TPUs are used.
 
@@ -68,3 +79,41 @@ def sleep_to_clear_queues():
   """
   tf.logging.info("Sleeping to allow TPU queues to clear.")
   time.sleep(60)
+
+
+def embedding_matmul(embedding_table, values, mask, name='embedding_matmul'):
+  """Performs embedding lookup via a matmul.
+
+  The matrix to be multiplied by the embedding table Tensor is constructed
+  via an implementation of scatter based on broadcasting embedding indices
+  and performing an equality comparison against a broadcasted
+  range(num_embedding_table_rows).
+
+  Args:
+    embedding_table: Tensor of embedding table. Rank 2 (table_size x embedding dim)
+    values: Tensor of embedding indices. Rank 2 (batch x n_indices)
+    mask: Tensor of mask / weights. Rank 2 (batch x n_indices)
+    name: Optional name scope for created ops
+
+  Returns:
+    Rank 3 tensor of embedding vectors.
+  """
+
+  with ops.name_scope(name):
+    n_embeddings, embedding_dim = embedding_table.get_shape().as_list()
+    batch_size, padded_size = values.shape.as_list()
+
+    emb_idcs = array_ops.tile(
+        array_ops.reshape(values, (batch_size, padded_size, 1)), (1, 1,
+                                                                  n_embeddings))
+    emb_weights = array_ops.tile(
+        array_ops.reshape(mask, (batch_size, padded_size, 1)),
+        (1, 1, n_embeddings))
+    col_idcs = array_ops.tile(
+        array_ops.reshape(math_ops.range(n_embeddings), (1, 1, n_embeddings)),
+        (batch_size, padded_size, 1))
+    one_hot = array_ops.where(
+        math_ops.equal(emb_idcs, col_idcs), emb_weights,
+        array_ops.zeros((batch_size, padded_size, n_embeddings)))
+
+    return math_ops.tensordot(one_hot, embedding_table, 1)

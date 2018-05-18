@@ -21,15 +21,18 @@ from __future__ import print_function
 import tensorflow as tf  # pylint: disable=g-bad-import-order
 
 from official.transformer.model import model_utils
+from official.utils.accelerator import tpu as tpu_utils
 
 
 class EmbeddingSharedWeights(tf.layers.Layer):
   """Calculates input embeddings and pre-softmax linear with shared weights."""
 
-  def __init__(self, vocab_size, hidden_size):
+  def __init__(self, vocab_size, hidden_size, method="gather"):
     super(EmbeddingSharedWeights, self).__init__()
     self.vocab_size = vocab_size
     self.hidden_size = hidden_size
+    assert method in ("gather", "matmul")
+    self.method = method
 
   def build(self, _):
     with tf.variable_scope("embedding_and_softmax", reuse=tf.AUTO_REUSE):
@@ -53,18 +56,24 @@ class EmbeddingSharedWeights(tf.layers.Layer):
         locations of the padding tokens in x.
     """
     with tf.name_scope("embedding"):
-      embeddings = tf.gather(self.shared_weights, x)
+      # Create binary mask of size [batch_size, length]
+      mask = tf.to_float(tf.not_equal(x, 0))
+
+      if self.method == "gather" and False:
+        embeddings = tf.gather(self.shared_weights, x)
+        embeddings *= tf.expand_dims(mask, -1)
+      else:  # matmul
+        embeddings = tpu_utils.embedding_matmul(
+            embedding_table=self.shared_weights,
+            values=tf.cast(x, dtype=tf.int32),
+            mask=mask
+        )
 
       # Scale embedding by the sqrt of the hidden size
       embeddings *= self.hidden_size ** 0.5
 
-      # Create binary array of size [batch_size, length]
-      # where 1 = padding, 0 = not padding
-      padding = model_utils.get_padding(x)
-
-      # Set all padding embedding values to 0
-      embeddings *= tf.expand_dims(1 - padding, -1)
       return embeddings
+
 
   def linear(self, x):
     """Computes logits by running x through a linear layer.
