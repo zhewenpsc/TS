@@ -304,15 +304,9 @@ def run_loop(
         steps=schedule_manager.single_iteration_train_steps,
         hooks=train_hooks)
 
-    if schedule_manager.use_tpu:
-      tpu_util.sleep_to_clear_queues()
-
     eval_results = estimator.evaluate(
         input_fn=dataset.eval_input_fn,
         steps=schedule_manager.single_iteration_eval_steps)
-
-    if schedule_manager.use_tpu:
-      tpu_util.sleep_to_clear_queues()
 
     tf.logging.info("Evaluation results (iter %d/%d):" %
                     (i + 1, schedule_manager.train_eval_iterations))

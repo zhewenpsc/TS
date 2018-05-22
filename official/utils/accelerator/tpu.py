@@ -70,17 +70,6 @@ def construct_scalar_host_call(metric_dict, model_dir, prefix=""):
   return host_call_fn, [gs_t] + other_tensors
 
 
-def sleep_to_clear_queues():
-  """Sleep for a minute if TPUs are used.
-
-  There is currently an issue with TPUs where starting a train or evaluation
-  before all of the TPU queues have cleared causes the TPU to freeze. This
-  is a temporary workaround until the issue can be properly resolved.
-  """
-  tf.logging.info("Sleeping to allow TPU queues to clear.")
-  time.sleep(60)
-
-
 def embedding_matmul(embedding_table, values, mask, name='embedding_matmul'):
   """Performs embedding lookup via a matmul.
 
